@@ -1,5 +1,7 @@
 .DS_Store
 **/.DS_Store
+scripts/.pids/
+scripts/logs/
 参考前端/
 .trae
 backend-node/scripts

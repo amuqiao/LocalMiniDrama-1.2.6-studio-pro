@@ -19,6 +19,19 @@ frontweb/       Vue 3 + Vite 前端
 desktop/        Electron 桌面壳（内嵌后端和前端 dist）
 ```
 
+## 服务管理（推荐）
+
+项目根目录提供统一脚本，详见 `docs/ops-manual.md`：
+
+```bash
+./service.sh start    # 启动后端（:5679）+ 前端（:3013）
+./service.sh stop     # 停止所有服务
+./service.sh restart  # 重启所有服务
+./service.sh status   # 查看运行状态
+```
+
+日志位于 `scripts/logs/{backend,frontend}.log`。
+
 ## 开发命令
 
 ### 后端
