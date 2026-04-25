@@ -2,6 +2,8 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const http = require('http');
+const https = require('https');
 const aiConfigService = require('./aiConfigService');
 const uploadService = require('./uploadService');
 const storageLayout = require('./storageLayout');
@@ -124,6 +126,190 @@ function buildImageUrl(config) {
   let ep = config.endpoint || '/images/generations';
   if (!ep.startsWith('/')) ep = '/' + ep;
   return base + ep;
+}
+
+// gpt-image-1/2 参考图场景走 /images/edits（multipart），base_url 通常已含 /v1
+function buildImageEditUrl(config) {
+  const base = (config.base_url || '').replace(/\/$/, '');
+  return base + '/images/edits';
+}
+
+/**
+ * 构建 multipart/form-data Buffer（纯 Node.js，无第三方依赖）
+ * @param {Array<{name:string, value:string}>} fields 文本字段
+ * @param {Array<{name:string, filename:string, mime:string, buffer:Buffer}>} files 文件字段
+ * @returns {{ buffer: Buffer, boundary: string }}
+ */
+function buildMultipartForm(fields, files) {
+  const boundary = 'FormBoundary' + crypto.randomBytes(12).toString('hex');
+  const parts = [];
+  for (const { name, value } of fields) {
+    parts.push(Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`
+    ));
+  }
+  for (const { name, filename, mime, buffer } of files) {
+    parts.push(Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="${name}"; filename="${filename}"\r\nContent-Type: ${mime}\r\n\r\n`
+    ));
+    parts.push(buffer);
+    parts.push(Buffer.from('\r\n'));
+  }
+  parts.push(Buffer.from(`--${boundary}--\r\n`));
+  return { buffer: Buffer.concat(parts), boundary };
+}
+
+/**
+ * multipart/form-data POST，与 postJSONWithTimeout 同样使用 Node http(s)，避免 undici 大包体问题
+ * @returns {Promise<{ statusCode: number, raw: string }>}
+ */
+function postMultipartWithTimeout(url, apiKey, formBuffer, boundary, timeoutMs = 600000) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const mod = parsed.protocol === 'https:' ? https : http;
+    const options = {
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': formBuffer.length,
+        Authorization: 'Bearer ' + apiKey,
+      },
+    };
+    const req = mod.request(options, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => { clearTimeout(timer); resolve({ statusCode: res.statusCode || 0, raw: Buffer.concat(chunks).toString('utf-8') }); });
+      res.on('error', (e) => { clearTimeout(timer); reject(e); });
+    });
+    const timer = setTimeout(() => { req.destroy(); reject(new Error(`gpt-image edit timeout after ${timeoutMs}ms`)); }, timeoutMs);
+    req.on('error', (e) => { clearTimeout(timer); reject(e); });
+    req.write(formBuffer);
+    req.end();
+  });
+}
+
+/**
+ * 将单个 resolvedRef（data:image/TYPE;base64,DATA 或 https URL）转为 { buffer, mime }
+ * 公网 URL 需要下载；data URL 直接解码。
+ */
+async function refToBuffer(ref, timeoutMs = 30000) {
+  if (ref.startsWith('data:')) {
+    const match = ref.match(/^data:(image\/\w+);base64,(.+)$/);
+    if (!match) return null;
+    return { buffer: Buffer.from(match[2], 'base64'), mime: match[1] };
+  }
+  // 公网 URL 下载
+  return new Promise((resolve) => {
+    const parsed = new URL(ref);
+    const mod = parsed.protocol === 'https:' ? https : http;
+    const req = mod.get(ref, { timeout: timeoutMs }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const ct = res.headers['content-type'] || 'image/png';
+        const mime = ct.split(';')[0].trim();
+        resolve({ buffer: Buffer.concat(chunks), mime });
+      });
+      res.on('error', () => resolve(null));
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+  });
+}
+
+/**
+ * gpt-image-1 / gpt-image-2 分镜参考图生成：走 /images/edits（multipart/form-data）
+ * - 参考图以 image[] 文件字段传入，模型在生成时保持视觉一致性
+ * - 无参考图时不走此函数，直接走 /images/generations
+ */
+async function callGptImageEditApi(config, log, opts) {
+  const { prompt, model, size, quality, image_gen_id, resolvedRefs } = opts;
+  const url = buildImageEditUrl(config);
+
+  // gpt-image-2 edits 支持的尺寸；不在列表内则用 auto，让模型自动选择
+  const EDIT_VALID_SIZES = new Set(['1024x1024', '1536x1024', '1024x1536', 'auto']);
+  const effectiveSize = EDIT_VALID_SIZES.has(size) ? size : 'auto';
+
+  // quality 合法值：auto / low / medium / high
+  const EDIT_VALID_QUALITY = new Set(['auto', 'low', 'medium', 'high']);
+  let effectiveQuality = quality && EDIT_VALID_QUALITY.has(String(quality).toLowerCase())
+    ? String(quality).toLowerCase() : null;
+
+  // 准备文本字段
+  const fields = [
+    { name: 'model', value: model },
+    { name: 'prompt', value: prompt || '' },
+    { name: 'size', value: effectiveSize },
+  ];
+  if (effectiveQuality) fields.push({ name: 'quality', value: effectiveQuality });
+
+  // 将参考图转为文件字段（最多 4 张，与 imageService REF_CAP 对齐）
+  const files = [];
+  const refsToUse = resolvedRefs.slice(0, 4);
+  for (let i = 0; i < refsToUse.length; i++) {
+    let result = null;
+    try { result = await refToBuffer(refsToUse[i]); } catch (_) {}
+    if (!result) {
+      log.warn('[gpt-image edit] 参考图转换失败，跳过', { image_gen_id, index: i });
+      continue;
+    }
+    const ext = result.mime.includes('png') ? 'png' : result.mime.includes('webp') ? 'webp' : 'jpg';
+    files.push({ name: 'image[]', filename: `ref${i}.${ext}`, mime: result.mime, buffer: result.buffer });
+  }
+
+  if (files.length === 0) {
+    log.warn('[gpt-image edit] 所有参考图均无法加载，降级到 /images/generations', { image_gen_id });
+    return null; // 通知调用方降级
+  }
+
+  const { buffer: formBuffer, boundary } = buildMultipartForm(fields, files);
+  log.info('[gpt-image edit] 发送 /images/edits', {
+    image_gen_id, url: url.slice(0, 70), model,
+    size: effectiveSize, quality: effectiveQuality,
+    ref_count: files.length,
+    form_kb: Math.round(formBuffer.length / 1024),
+  });
+
+  let raw, httpStatus;
+  try {
+    const out = await postMultipartWithTimeout(url, config.api_key || '', formBuffer, boundary, IMAGE_HTTP_TIMEOUT_MS);
+    httpStatus = out.statusCode;
+    raw = out.raw;
+  } catch (e) {
+    log.error('[gpt-image edit] 网络错误', { image_gen_id, error: e.message });
+    return { error: 'gpt-image edit 网络请求失败: ' + e.message };
+  }
+
+  if (httpStatus < 200 || httpStatus >= 300) {
+    log.error('[gpt-image edit] HTTP 错误', { image_gen_id, status: httpStatus, body: raw.slice(0, 300) });
+    let errMsg = `gpt-image edit 请求失败: ${httpStatus}`;
+    try {
+      const errJson = JSON.parse(raw);
+      const msg = errJson.error?.message || errJson.message;
+      if (msg) errMsg += ' - ' + (typeof msg === 'string' ? msg : JSON.stringify(msg).slice(0, 200));
+    } catch (_) {
+      if (raw) errMsg += ' - ' + raw.slice(0, 200);
+    }
+    return { error: errMsg };
+  }
+
+  let data;
+  try { data = JSON.parse(raw); } catch (_) {
+    return { error: 'gpt-image edit 返回格式异常' };
+  }
+
+  const item = data.data && data.data[0];
+  if (item && item.b64_json) {
+    return { image_url: `data:image/png;base64,${item.b64_json}` };
+  }
+  if (item && (item.url || item.image_url)) {
+    return { image_url: item.url || item.image_url };
+  }
+  log.warn('[gpt-image edit] 未返回图片', { image_gen_id, keys: data ? Object.keys(data) : [] });
+  return { error: 'gpt-image edit 未返回图片地址' };
 }
 
 function getModelFromConfig(config, preferredModel) {
@@ -1393,6 +1579,8 @@ async function callImageApi(db, log, opts) {
   const isVolc = protocol === 'volcengine';
   // doubao-seedream 系列模型（含通过自定义代理使用的场景）：使用 volcengine 图片 API 规范
   const isSeedream = isVolc || /seedream|doubao/i.test(model);
+  // gpt-image-1 / gpt-image-2：OpenAI 原生新一代图像模型，仅返回 b64_json，参数集与 dall-e-3 不同
+  const isGptImage = /^gpt-image-/i.test(model);
   // 解析参考图：本地路径/localhost URL → base64，公网 URL → 直接传
   const rawRefs = Array.isArray(reference_image_urls) ? reference_image_urls.filter(Boolean) : [];
   const resolvedRefs = rawRefs.map((r) => resolveImageRef(r, files_base_url, storage_local_path)).filter(Boolean);
@@ -1407,13 +1595,36 @@ async function callImageApi(db, log, opts) {
   // doubao-seedream-4-5+ 要求最低 3686400 像素，不足时等比放大
   const effectiveSize = (isSeedream && size) ? fixSeedreamSize(size) : size;
 
+  // gpt-image-1/2 不支持 dall-e-3 的 quality 值（"standard"/"hd"），自动映射到合法值
+  let effectiveQuality = quality || null;
+  if (isGptImage && effectiveQuality) {
+    const qualityMap = { standard: 'auto', hd: 'high' };
+    effectiveQuality = qualityMap[effectiveQuality.toLowerCase()] || effectiveQuality;
+  }
+
+  // ── gpt-image-1/2 + 参考图 → /images/edits（multipart，原生支持多参考图保一致性）──────────────
+  // 无参考图时继续走 /images/generations（纯文生图路径）
+  if (isGptImage && resolvedRefs.length > 0) {
+    const editResult = await callGptImageEditApi(config, log, {
+      prompt: effectivePrompt,   // 已注入参考图标签的 prompt
+      model,
+      size: effectiveSize || size,
+      quality: effectiveQuality,
+      image_gen_id,
+      resolvedRefs,
+    });
+    // null 表示参考图全部加载失败，降级到 /images/generations 纯文生图
+    if (editResult !== null) return editResult;
+    log.warn('[gpt-image] /images/edits 降级到 /images/generations', { image_gen_id });
+  }
+
   const body = {
     model,
     prompt: effectivePrompt,
-    // doubao-seedream API 不使用 n，其他 OpenAI 兼容接口保留
-    ...(!isSeedream ? { n: 1 } : {}),
+    // gpt-image-1/2 和 doubao-seedream 不使用 n 参数
+    ...(!isSeedream && !isGptImage ? { n: 1 } : {}),
     ...(effectiveSize ? { size: effectiveSize } : {}),
-    ...(quality ? { quality } : {}),
+    ...(effectiveQuality ? { quality: effectiveQuality } : {}),
     // volcengine 原生或 doubao-seedream 模型均需关闭水印（默认为 true）
     ...((isVolc || isSeedream) ? { watermark: false } : {}),
     // 多张参考图时加 negative_prompt，防止模型把参考图拼成左右分割的合图
@@ -1460,7 +1671,11 @@ async function callImageApi(db, log, opts) {
   }
   // 兼容多种返回格式：OpenAI 风格 data[].url / b64_json，部分厂商 data[].image_url 或 data.output 等
   const item = data.data && data.data[0];
-  const imageUrl = item && (item.url || item.image_url || item.b64_json);
+  let imageUrl = item && (item.url || item.image_url || null);
+  // gpt-image-1 / gpt-image-2 只返回 b64_json（不支持 URL 格式），需加 data: 前缀才能被 downloadImageToLocal 正确处理
+  if (!imageUrl && item && item.b64_json) {
+    imageUrl = `data:image/png;base64,${item.b64_json}`;
+  }
   if (!imageUrl) {
     log.warn('Image API no image URL in response', {
       image_gen_id,
