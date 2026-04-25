@@ -1782,6 +1782,7 @@ function createAndGenerateImage(db, log, opts) {
         return;
       }
       let localPath = null;
+      let storedImageUrl = result.image_url; // 写入 DB 的 image_url
       try {
         const loadConfig = require('../config').loadConfig;
         const cfg = loadConfig();
@@ -1798,34 +1799,39 @@ function createAndGenerateImage(db, log, opts) {
           'ig',
           projectSubdir
         );
+        // 优先用 base_url + local_path 作为 image_url，避免把几 MB 的 base64 写进 DB
+        if (localPath) {
+          const baseUrl = (cfg.storage?.base_url || '').replace(/\/$/, '');
+          if (baseUrl) storedImageUrl = baseUrl + '/' + localPath.replace(/^\//, '');
+        }
       } catch (_) {}
       // 兼容旧库无 completed_at：先试完整 UPDATE，失败则只更新必有列
       try {
         db.prepare(
           'UPDATE image_generations SET status = ?, image_url = ?, local_path = ?, completed_at = ?, updated_at = ? WHERE id = ?'
-        ).run('completed', result.image_url, localPath, now2, now2, imageGenId);
+        ).run('completed', storedImageUrl, localPath, now2, now2, imageGenId);
       } catch (e) {
         if ((e.message || '').includes('completed_at')) {
           db.prepare(
             'UPDATE image_generations SET status = ?, image_url = ?, local_path = ?, updated_at = ? WHERE id = ?'
-          ).run('completed', result.image_url, localPath, now2, imageGenId);
+          ).run('completed', storedImageUrl, localPath, now2, imageGenId);
         } else {
           throw e;
         }
       }
-      taskService.updateTaskResult(db, taskId, { image_generation_id: imageGenId, image_url: result.image_url, local_path: localPath, status: 'completed' });
+      taskService.updateTaskResult(db, taskId, { image_generation_id: imageGenId, image_url: storedImageUrl, local_path: localPath, status: 'completed' });
       if (charIdNum != null) {
         try {
           // 旧图追加到 extra_images，与上传逻辑保持一致
           const oldChar = db.prepare('SELECT local_path, image_url, extra_images FROM characters WHERE id = ?').get(charIdNum);
-          const oldPath = oldChar?.local_path || oldChar?.image_url || '';
+          const oldPath = oldChar?.local_path || (oldChar?.image_url && !String(oldChar.image_url).startsWith('data:') ? oldChar.image_url : '') || '';
           let extras = [];
           try { extras = oldChar?.extra_images ? JSON.parse(oldChar.extra_images) : []; } catch (_) {}
           if (!Array.isArray(extras)) extras = [];
           if (oldPath && !extras.includes(oldPath)) extras.push(oldPath);
           const extraJson = extras.length ? JSON.stringify(extras) : null;
           db.prepare('UPDATE characters SET image_url = ?, local_path = ?, extra_images = ?, updated_at = ? WHERE id = ?').run(
-            result.image_url,
+            storedImageUrl,
             localPath,
             extraJson,
             now2,
@@ -1833,25 +1839,25 @@ function createAndGenerateImage(db, log, opts) {
           );
         } catch (e) {
           if ((e.message || '').includes('local_path') || (e.message || '').includes('extra_images')) {
-            db.prepare('UPDATE characters SET image_url = ?, updated_at = ? WHERE id = ?').run(result.image_url, now2, charIdNum);
+            db.prepare('UPDATE characters SET image_url = ?, updated_at = ? WHERE id = ?').run(storedImageUrl, now2, charIdNum);
           } else {
             throw e;
           }
         }
-        log.info('Character image updated', { character_id: charIdNum, image_url: result.image_url, local_path: localPath });
+        log.info('Character image updated', { character_id: charIdNum, image_url: storedImageUrl, local_path: localPath });
       }
       if (sceneIdNum != null) {
         try {
           // 旧图追加到 extra_images，与上传逻辑保持一致
           const oldScene = db.prepare('SELECT local_path, image_url, extra_images FROM scenes WHERE id = ?').get(sceneIdNum);
-          const oldPath = oldScene?.local_path || oldScene?.image_url || '';
+          const oldPath = oldScene?.local_path || (oldScene?.image_url && !String(oldScene.image_url).startsWith('data:') ? oldScene.image_url : '') || '';
           let extras = [];
           try { extras = oldScene?.extra_images ? JSON.parse(oldScene.extra_images) : []; } catch (_) {}
           if (!Array.isArray(extras)) extras = [];
           if (oldPath && !extras.includes(oldPath)) extras.push(oldPath);
           const extraJson = extras.length ? JSON.stringify(extras) : null;
           db.prepare('UPDATE scenes SET image_url = ?, local_path = ?, extra_images = ?, updated_at = ? WHERE id = ?').run(
-            result.image_url,
+            storedImageUrl,
             localPath,
             extraJson,
             now2,
@@ -1859,12 +1865,12 @@ function createAndGenerateImage(db, log, opts) {
           );
         } catch (e) {
           if ((e.message || '').includes('local_path') || (e.message || '').includes('extra_images')) {
-            db.prepare('UPDATE scenes SET image_url = ?, updated_at = ? WHERE id = ?').run(result.image_url, now2, sceneIdNum);
+            db.prepare('UPDATE scenes SET image_url = ?, updated_at = ? WHERE id = ?').run(storedImageUrl, now2, sceneIdNum);
           } else {
             throw e;
           }
         }
-        log.info('Scene image updated', { scene_id: sceneIdNum, image_url: result.image_url, local_path: localPath });
+        log.info('Scene image updated', { scene_id: sceneIdNum, image_url: storedImageUrl, local_path: localPath });
       }
       log.info('Image generation completed', { image_gen_id: imageGenId, local_path: localPath });
     } catch (err) {
